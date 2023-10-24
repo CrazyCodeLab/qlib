@@ -38,14 +38,13 @@ class TRAModel(Model):
         model_init_state=None,
         lamb=0.0,
         rho=0.99,
-        seed=0,
+        seed=None,
         logdir=None,
         eval_train=True,
         eval_test=False,
         avg_params=True,
         **kwargs,
     ):
-
         np.random.seed(seed)
         torch.manual_seed(seed)
 
@@ -93,7 +92,6 @@ class TRAModel(Model):
         self.global_step = -1
 
     def train_epoch(self, data_set):
-
         self.model.train()
         self.tra.train()
 
@@ -124,13 +122,13 @@ class TRAModel(Model):
             loss = (pred - label).pow(2).mean()
 
             L = (all_preds.detach() - label[:, None]).pow(2)
-            L -= L.min(dim=-1, keepdim=True).values  # normalize & ensure postive input
+            L -= L.min(dim=-1, keepdim=True).values  # normalize & ensure positive input
 
             data_set.assign_data(index, L)  # save loss to memory
 
             if prob is not None:
                 P = sinkhorn(-L, epsilon=0.01)  # sample assignment matrix
-                lamb = self.lamb * (self.rho ** self.global_step)
+                lamb = self.lamb * (self.rho**self.global_step)
                 reg = prob.log().mul(P).sum(dim=-1).mean()
                 loss = loss - lamb * reg
 
@@ -146,7 +144,6 @@ class TRAModel(Model):
         return total_loss
 
     def test_epoch(self, data_set, return_pred=False):
-
         self.model.eval()
         self.tra.eval()
         data_set.eval()
@@ -165,7 +162,7 @@ class TRAModel(Model):
 
             L = (all_preds - label[:, None]).pow(2)
 
-            L -= L.min(dim=-1, keepdim=True).values  # normalize & ensure postive input
+            L -= L.min(dim=-1, keepdim=True).values  # normalize & ensure positive input
 
             data_set.assign_data(index, L)  # save loss to memory
 
@@ -204,7 +201,6 @@ class TRAModel(Model):
         return metrics, preds
 
     def fit(self, dataset, evals_result=dict()):
-
         train_set, valid_set, test_set = dataset.prepare(["train", "valid", "test"])
 
         best_score = -1
@@ -380,7 +376,6 @@ class LSTM(nn.Module):
             self.output_size = hidden_size
 
     def forward(self, x):
-
         x = self.input_drop(x)
 
         if self.training and self.noise_level > 0:
@@ -464,7 +459,6 @@ class Transformer(nn.Module):
         self.output_size = hidden_size
 
     def forward(self, x):
-
         x = self.input_drop(x)
 
         if self.training and self.noise_level > 0:
@@ -484,7 +478,7 @@ class TRA(nn.Module):
 
     """Temporal Routing Adaptor (TRA)
 
-    TRA takes historical prediction erros & latent representation as inputs,
+    TRA takes historical prediction errors & latent representation as inputs,
     then routes the input sample to a specific predictor for training & inference.
 
     Args:
@@ -514,7 +508,6 @@ class TRA(nn.Module):
         self.predictors = nn.Linear(input_size, num_states)
 
     def forward(self, hidden, hist_loss):
-
         preds = self.predictors(hidden)
 
         if self.num_states == 1:
@@ -547,7 +540,7 @@ def evaluate(pred):
     score = pred.score
     label = pred.label
     diff = score - label
-    MSE = (diff ** 2).mean()
+    MSE = (diff**2).mean()
     MAE = (diff.abs()).mean()
     IC = score.corr(label)
     return {"MSE": MSE, "MAE": MAE, "IC": IC}

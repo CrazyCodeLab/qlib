@@ -27,6 +27,7 @@ from qlib import auto_init, get_module_logger
 from tqdm.cli import tqdm
 
 from .utils import get_mongodb
+from ...config import C
 
 
 class TaskManager:
@@ -47,7 +48,10 @@ class TaskManager:
     The tasks manager assumes that you will only update the tasks you fetched.
     The mongo fetch one and update will make it date updating secure.
 
-    This class can be used as a tool from commandline. Here are serveral examples
+    This class can be used as a tool from commandline. Here are several examples.
+    You can view the help of manage module with the following commands:
+    python -m qlib.workflow.task.manage -h # show manual of manage module CLI
+    python -m qlib.workflow.task.manage wait -h # show manual of the wait command of manage
 
     .. code-block:: shell
 
@@ -90,6 +94,7 @@ class TaskManager:
         """
         self.task_pool: pymongo.collection.Collection = getattr(get_mongodb(), task_pool)
         self.logger = get_module_logger(self.__class__.__name__)
+        self.logger.info(f"task_pool:{task_pool}")
 
     @staticmethod
     def list() -> list:
@@ -105,7 +110,7 @@ class TaskManager:
         for prefix in self.ENCODE_FIELDS_PREFIX:
             for k in list(task.keys()):
                 if k.startswith(prefix):
-                    task[k] = Binary(pickle.dumps(task[k]))
+                    task[k] = Binary(pickle.dumps(task[k], protocol=C.dump_protocol_version))
         return task
 
     def _decode_task(self, task):
@@ -314,6 +319,8 @@ class TaskManager:
         Query task in collection.
         This function may raise exception `pymongo.errors.CursorNotFound: cursor id not found` if it takes too long to iterate the generator
 
+        python -m qlib.workflow.task.manage -t <your task pool> query '{"_id": "615498be837d0053acbc5d58"}'
+
         Parameters
         ----------
         query: dict
@@ -354,11 +361,14 @@ class TaskManager:
         # A workaround to use the class attribute.
         if status is None:
             status = TaskManager.STATUS_DONE
-        self.task_pool.update_one({"_id": task["_id"]}, {"$set": {"status": status, "res": Binary(pickle.dumps(res))}})
+        self.task_pool.update_one(
+            {"_id": task["_id"]},
+            {"$set": {"status": status, "res": Binary(pickle.dumps(res, protocol=C.dump_protocol_version))}},
+        )
 
     def return_task(self, task, status=STATUS_WAITING):
         """
-        Return a task to status. Alway using in error handling.
+        Return a task to status. Always using in error handling.
 
         Args:
             task ([type]): [description]
@@ -479,7 +489,7 @@ def run_task(
     after_status: str = TaskManager.STATUS_DONE,
     **kwargs,
 ):
-    """
+    r"""
     While the task pool is not empty (has WAITING tasks), use task_func to fetch and run tasks in task_pool
 
     After running this method, here are 4 situations (before_status -> after_status):
@@ -495,8 +505,9 @@ def run_task(
     Parameters
     ----------
     task_func : Callable
-        def (task_def, **kwargs) -> <res which will be committed>
-            the function to run the task
+        def (task_def, \**kwargs) -> <res which will be committed>
+
+        the function to run the task
     task_pool : str
         the name of the task pool (Collection in MongoDB)
     query: dict

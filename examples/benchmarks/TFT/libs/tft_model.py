@@ -342,7 +342,7 @@ class TFTDataCache:
 
     @classmethod
     def contains(cls, key):
-        """Retuns boolean indicating whether key is present in cache."""
+        """Returns boolean indicating whether key is present in cache."""
 
         return key in cls._data_cache
 
@@ -475,7 +475,6 @@ class TemporalFusionTransformer:
 
         embeddings = []
         for i in range(num_categorical_variables):
-
             embedding = tf.keras.Sequential(
                 [
                     tf.keras.layers.InputLayer([time_steps]),
@@ -680,7 +679,6 @@ class TemporalFusionTransformer:
 
         data_map = {}
         for _, sliced in data.groupby(id_col):
-
             col_mappings = {"identifier": [id_col], "time": [time_col], "outputs": [target_col], "inputs": input_cols}
 
             for k in col_mappings:
@@ -954,7 +952,6 @@ class TemporalFusionTransformer:
         """
 
         with tf.variable_scope(self.name):
-
             transformer_layer, all_inputs, attention_components = self._build_base_graph()
 
             outputs = tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(self.output_size * len(self.quantiles)))(
@@ -1120,10 +1117,10 @@ class TemporalFusionTransformer:
         Args:
           df: Input dataframe
           return_targets: Whether to also return outputs aligned with predictions to
-            faciliate evaluation
+            facilitate evaluation
 
         Returns:
-          Input dataframe or tuple of (input dataframe, algined output dataframe).
+          Input dataframe or tuple of (input dataframe, aligned output dataframe).
         """
 
         data = self._batch_data(df)

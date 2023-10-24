@@ -1,45 +1,43 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+# TODO: this utils covers too much utilities, please seperat it into sub modules
 
 from __future__ import division
 from __future__ import print_function
 
 import os
-import pickle
 import re
-import sys
 import copy
 import json
 import yaml
 import redis
 import bisect
-import shutil
+import struct
 import difflib
+import inspect
 import hashlib
 import datetime
 import requests
-import tempfile
-import importlib
-import contextlib
 import collections
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Union, Tuple, Any, Text, Optional
-from types import ModuleType
-from urllib.parse import urlparse
-
+from typing import List, Union, Optional, Callable
+from packaging import version
+from .file import get_or_create_path, save_multiple_parts_file, unpack_archive_with_buffer, get_tmp_file_with_buffer
 from ..config import C
 from ..log import get_module_logger, set_log_with_config
 
 log = get_module_logger("utils")
+# MultiIndex.is_lexsorted() is a deprecated method in Pandas 1.3.0.
+is_deprecated_lexsorted_pandas = version.parse(pd.__version__) > version.parse("1.3.0")
 
 
 #################### Server ####################
 def get_redis_connection():
     """get redis connection instance."""
-    return redis.StrictRedis(host=C.redis_host, port=C.redis_port, db=C.redis_task_db)
+    return redis.StrictRedis(host=C.redis_host, port=C.redis_port, db=C.redis_task_db, password=C.redis_password)
 
 
 #################### Data ####################
@@ -58,6 +56,104 @@ def read_bin(file_path: Union[str, Path], start_index, end_index):
         data = np.frombuffer(f.read(4 * count), dtype="<f")
         series = pd.Series(data, index=pd.RangeIndex(si, si + len(data)))
     return series
+
+
+def get_period_list(first: int, last: int, quarterly: bool) -> List[int]:
+    """
+    This method will be used in PIT database.
+    It return all the possible values between `first` and `end`  (first and end is included)
+
+    Parameters
+    ----------
+    quarterly : bool
+        will it return quarterly index or yearly index.
+
+    Returns
+    -------
+    List[int]
+        the possible index between [first, last]
+    """
+
+    if not quarterly:
+        assert all(1900 <= x <= 2099 for x in (first, last)), "invalid arguments"
+        return list(range(first, last + 1))
+    else:
+        assert all(190000 <= x <= 209904 for x in (first, last)), "invalid arguments"
+        res = []
+        for year in range(first // 100, last // 100 + 1):
+            for q in range(1, 5):
+                period = year * 100 + q
+                if first <= period <= last:
+                    res.append(year * 100 + q)
+        return res
+
+
+def get_period_offset(first_year, period, quarterly):
+    if quarterly:
+        offset = (period // 100 - first_year) * 4 + period % 100 - 1
+    else:
+        offset = period - first_year
+    return offset
+
+
+def read_period_data(index_path, data_path, period, cur_date_int: int, quarterly, last_period_index: int = None):
+    """
+    At `cur_date`(e.g. 20190102), read the information at `period`(e.g. 201803).
+    Only the updating info before cur_date or at cur_date will be used.
+
+    Parameters
+    ----------
+    period: int
+        date period represented by interger, e.g. 201901 corresponds to the first quarter in 2019
+    cur_date_int: int
+        date which represented by interger, e.g. 20190102
+    last_period_index: int
+        it is a optional parameter; it is designed to avoid repeatedly access the .index data of PIT database when
+        sequentially observing the data (Because the latest index of a specific period of data certainly appear in after the one in last observation).
+
+    Returns
+    -------
+    the query value and byte index the index value
+    """
+    DATA_DTYPE = "".join(
+        [
+            C.pit_record_type["date"],
+            C.pit_record_type["period"],
+            C.pit_record_type["value"],
+            C.pit_record_type["index"],
+        ]
+    )
+
+    PERIOD_DTYPE = C.pit_record_type["period"]
+    INDEX_DTYPE = C.pit_record_type["index"]
+
+    NAN_VALUE = C.pit_record_nan["value"]
+    NAN_INDEX = C.pit_record_nan["index"]
+
+    # find the first index of linked revisions
+    if last_period_index is None:
+        with open(index_path, "rb") as fi:
+            (first_year,) = struct.unpack(PERIOD_DTYPE, fi.read(struct.calcsize(PERIOD_DTYPE)))
+            all_periods = np.fromfile(fi, dtype=INDEX_DTYPE)
+        offset = get_period_offset(first_year, period, quarterly)
+        _next = all_periods[offset]
+    else:
+        _next = last_period_index
+
+    # load data following the `_next` link
+    prev_value = NAN_VALUE
+    prev_next = _next
+
+    with open(data_path, "rb") as fd:
+        while _next != NAN_INDEX:
+            fd.seek(_next)
+            date, period, value, new_next = struct.unpack(DATA_DTYPE, fd.read(struct.calcsize(DATA_DTYPE)))
+            if date > cur_date_int:
+                break
+            prev_next = _next
+            _next = new_next
+            prev_value = value
+    return prev_value, prev_next
 
 
 def np_ffill(arr: np.array):
@@ -122,7 +218,7 @@ def requests_with_retry(url, retry=5, **kwargs):
         except Exception as e:
             log.warning("exception encountered {}".format(e))
             continue
-    raise Exception("ERROR: requests failed!")
+    raise TimeoutError("ERROR: requests failed!")
 
 
 #################### Parse ####################
@@ -137,8 +233,8 @@ def parse_config(config):
     # Check whether the str can be parsed
     try:
         return yaml.safe_load(config)
-    except BaseException:
-        raise ValueError("cannot parse config!")
+    except BaseException as base_exp:
+        raise ValueError("cannot parse config!") from base_exp
 
 
 #################### Other ####################
@@ -165,116 +261,24 @@ def parse_field(field):
     # - $close -> Feature("close")
     # - $close5 -> Feature("close5")
     # - $open+$close -> Feature("open")+Feature("close")
+    # TODO: this maybe used in the feature if we want to support the computation of different frequency data
+    # - $close@5min -> Feature("close", "5min")
+
     if not isinstance(field, str):
         field = str(field)
-    return re.sub(r"\$(\w+)", r'Feature("\1")', re.sub(r"(\w+\s*)\(", r"Operators.\1(", field))
-
-
-def get_module_by_module_path(module_path: Union[str, ModuleType]):
-    """Load module path
-
-    :param module_path:
-    :return:
-    """
-    if isinstance(module_path, ModuleType):
-        module = module_path
-    else:
-        if module_path.endswith(".py"):
-            module_name = re.sub("^[^a-zA-Z_]+", "", re.sub("[^0-9a-zA-Z_]", "", module_path[:-3].replace("/", "_")))
-            module_spec = importlib.util.spec_from_file_location(module_name, module_path)
-            module = importlib.util.module_from_spec(module_spec)
-            sys.modules[module_name] = module
-            module_spec.loader.exec_module(module)
-        else:
-            module = importlib.import_module(module_path)
-    return module
-
-
-def get_callable_kwargs(config: Union[dict, str], default_module: Union[str, ModuleType] = None) -> (type, dict):
-    """
-    extract class/func and kwargs from config info
-
-    Parameters
-    ----------
-    config : [dict, str]
-        similar to config
-
-    default_module : Python module or str
-        It should be a python module to load the class type
-        This function will load class from the config['module_path'] first.
-        If config['module_path'] doesn't exists, it will load the class from default_module.
-
-    Returns
-    -------
-    (type, dict):
-        the class/func object and it's arguments.
-    """
-    if isinstance(config, dict):
-        module = get_module_by_module_path(config.get("module_path", default_module))
-
-        # raise AttributeError
-        _callable = getattr(module, config["class" if "class" in config else "func"])
-        kwargs = config.get("kwargs", {})
-    elif isinstance(config, str):
-        module = get_module_by_module_path(default_module)
-
-        _callable = getattr(module, config)
-        kwargs = {}
-    else:
-        raise NotImplementedError(f"This type of input is not supported")
-    return _callable, kwargs
-
-
-def init_instance_by_config(
-    config: Union[str, dict, object], default_module=None, accept_types: Union[type, Tuple[type]] = (), **kwargs
-) -> Any:
-    """
-    get initialized instance with config
-
-    Parameters
-    ----------
-    config : Union[str, dict, object]
-        dict example.
-            {
-                'class': 'ClassName',
-                'kwargs': dict, #  It is optional. {} will be used if not given
-                'model_path': path, # It is optional if module is given
-            }
-        str example.
-            1) specify a pickle object
-                - path like 'file:///<path to pickle file>/obj.pkl'
-            2) specify a class name
-                - "ClassName":  getattr(module, config)() will be used.
-        object example:
-            instance of accept_types
-    default_module : Python module
-        Optional. It should be a python module.
-        NOTE: the "module_path" will be override by `module` arguments
-
-        This function will load class from the config['module_path'] first.
-        If config['module_path'] doesn't exists, it will load the class from default_module.
-
-    accept_types: Union[type, Tuple[type]]
-        Optional. If the config is a instance of specific type, return the config directly.
-        This will be passed into the second parameter of isinstance.
-
-    Returns
-    -------
-    object:
-        An initialized object based on the config info
-    """
-    if isinstance(config, accept_types):
-        return config
-
-    if isinstance(config, str):
-        # path like 'file:///<path to pickle file>/obj.pkl'
-        pr = urlparse(config)
-        if pr.scheme == "file":
-            with open(os.path.join(pr.netloc, pr.path), "rb") as f:
-                return pickle.load(f)
-
-    klass, cls_kwargs = get_callable_kwargs(config, default_module=default_module)
-    return klass(**cls_kwargs, **kwargs)
+    # Chinese punctuation regex:
+    # \u3001 -> 、
+    # \uff1a -> ：
+    # \uff08 -> (
+    # \uff09 -> )
+    chinese_punctuation_regex = r"\u3001\uff1a\uff08\uff09"
+    for pattern, new in [
+        (rf"\$\$([\w{chinese_punctuation_regex}]+)", r'PFeature("\1")'),  # $$ must be before $
+        (rf"\$([\w{chinese_punctuation_regex}]+)", r'Feature("\1")'),
+        (r"(\w+\s*)\(", r"Operators.\1("),
+    ]:  # Features  # Operators
+        field = re.sub(pattern, new, field)
+    return field
 
 
 def compare_dict_value(src_data: dict, dst_data: dict):
@@ -300,153 +304,6 @@ def compare_dict_value(src_data: dict, dst_data: dict):
     return changes
 
 
-def get_or_create_path(path: Optional[Text] = None, return_dir: bool = False):
-    """Create or get a file or directory given the path and return_dir.
-
-    Parameters
-    ----------
-    path: a string indicates the path or None indicates creating a temporary path.
-    return_dir: if True, create and return a directory; otherwise c&r a file.
-
-    """
-    if path:
-        if return_dir and not os.path.exists(path):
-            os.makedirs(path)
-        elif not return_dir:  # return a file, thus we need to create its parent directory
-            xpath = os.path.abspath(os.path.join(path, ".."))
-            if not os.path.exists(xpath):
-                os.makedirs(xpath)
-    else:
-        temp_dir = os.path.expanduser("~/tmp")
-        if not os.path.exists(temp_dir):
-            os.makedirs(temp_dir)
-        if return_dir:
-            _, path = tempfile.mkdtemp(dir=temp_dir)
-        else:
-            _, path = tempfile.mkstemp(dir=temp_dir)
-    return path
-
-
-@contextlib.contextmanager
-def save_multiple_parts_file(filename, format="gztar"):
-    """Save multiple parts file
-
-    Implementation process:
-        1. get the absolute path to 'filename'
-        2. create a 'filename' directory
-        3. user does something with file_path('filename/')
-        4. remove 'filename' directory
-        5. make_archive 'filename' directory, and rename 'archive file' to filename
-
-    :param filename: result model path
-    :param format: archive format: one of "zip", "tar", "gztar", "bztar", or "xztar"
-    :return: real model path
-
-    Usage::
-
-        >>> # The following code will create an archive file('~/tmp/test_file') containing 'test_doc_i'(i is 0-10) files.
-        >>> with save_multiple_parts_file('~/tmp/test_file') as filename_dir:
-        ...   for i in range(10):
-        ...       temp_path = os.path.join(filename_dir, 'test_doc_{}'.format(str(i)))
-        ...       with open(temp_path) as fp:
-        ...           fp.write(str(i))
-        ...
-
-    """
-
-    if filename.startswith("~"):
-        filename = os.path.expanduser(filename)
-
-    file_path = os.path.abspath(filename)
-
-    # Create model dir
-    if os.path.exists(file_path):
-        raise FileExistsError("ERROR: file exists: {}, cannot be create the directory.".format(file_path))
-
-    os.makedirs(file_path)
-
-    # return model dir
-    yield file_path
-
-    # filename dir to filename.tar.gz file
-    tar_file = shutil.make_archive(file_path, format=format, root_dir=file_path)
-
-    # Remove filename dir
-    if os.path.exists(file_path):
-        shutil.rmtree(file_path)
-
-    # filename.tar.gz rename to filename
-    os.rename(tar_file, file_path)
-
-
-@contextlib.contextmanager
-def unpack_archive_with_buffer(buffer, format="gztar"):
-    """Unpack archive with archive buffer
-    After the call is finished, the archive file and directory will be deleted.
-
-    Implementation process:
-        1. create 'tempfile' in '~/tmp/' and directory
-        2. 'buffer' write to 'tempfile'
-        3. unpack archive file('tempfile')
-        4. user does something with file_path('tempfile/')
-        5. remove 'tempfile' and 'tempfile directory'
-
-    :param buffer: bytes
-    :param format: archive format: one of "zip", "tar", "gztar", "bztar", or "xztar"
-    :return: unpack archive directory path
-
-    Usage::
-
-        >>> # The following code is to print all the file names in 'test_unpack.tar.gz'
-        >>> with open('test_unpack.tar.gz') as fp:
-        ...     buffer = fp.read()
-        ...
-        >>> with unpack_archive_with_buffer(buffer) as temp_dir:
-        ...     for f_n in os.listdir(temp_dir):
-        ...         print(f_n)
-        ...
-
-    """
-    temp_dir = os.path.expanduser("~/tmp")
-    if not os.path.exists(temp_dir):
-        os.makedirs(temp_dir)
-    with tempfile.NamedTemporaryFile("wb", delete=False, dir=temp_dir) as fp:
-        fp.write(buffer)
-        file_path = fp.name
-
-    try:
-        tar_file = file_path + ".tar.gz"
-        os.rename(file_path, tar_file)
-        # Create dir
-        os.makedirs(file_path)
-        shutil.unpack_archive(tar_file, format=format, extract_dir=file_path)
-
-        # Return temp dir
-        yield file_path
-
-    except Exception as e:
-        log.error(str(e))
-    finally:
-        # Remove temp tar file
-        if os.path.exists(tar_file):
-            os.unlink(tar_file)
-
-        # Remove temp model dir
-        if os.path.exists(file_path):
-            shutil.rmtree(file_path)
-
-
-@contextlib.contextmanager
-def get_tmp_file_with_buffer(buffer):
-    temp_dir = os.path.expanduser("~/tmp")
-    if not os.path.exists(temp_dir):
-        os.makedirs(temp_dir)
-    with tempfile.NamedTemporaryFile("wb", delete=True, dir=temp_dir) as fp:
-        fp.write(buffer)
-        file_path = fp.name
-        yield file_path
-
-
 def remove_repeat_field(fields):
     """remove repeat field
 
@@ -466,7 +323,7 @@ def remove_fields_space(fields: [list, str, tuple]):
     """
     if isinstance(fields, str):
         return fields.replace(" ", "")
-    return [i.replace(" ", "") for i in fields if isinstance(i, str)]
+    return [i.replace(" ", "") if isinstance(i, str) else str(i) for i in fields]
 
 
 def normalize_cache_fields(fields: [list, tuple]):
@@ -500,7 +357,7 @@ def is_tradable_date(cur_date):
     date : pandas.Timestamp
         current date
     """
-    from ..data import D
+    from ..data import D  # pylint: disable=C0415
 
     return str(cur_date.date()) == str(D.calendar(start_time=cur_date, future=True)[0].date())
 
@@ -517,7 +374,7 @@ def get_date_range(trading_date, left_shift=0, right_shift=0, future=False):
 
     """
 
-    from ..data import D
+    from ..data import D  # pylint: disable=C0415
 
     start = get_date_by_shift(trading_date, left_shift, future=future)
     end = get_date_by_shift(trading_date, right_shift, future=future)
@@ -526,8 +383,8 @@ def get_date_range(trading_date, left_shift=0, right_shift=0, future=False):
     return calendar
 
 
-def get_date_by_shift(trading_date, shift, future=False, clip_shift=True, freq="day"):
-    """get trading date with shift bias wil cur_date
+def get_date_by_shift(trading_date, shift, future=False, clip_shift=True, freq="day", align: Optional[str] = None):
+    """get trading date with shift bias will cur_date
         e.g. : shift == 1,  return next trading date
                shift == -1, return previous trading date
     ----------
@@ -535,14 +392,25 @@ def get_date_by_shift(trading_date, shift, future=False, clip_shift=True, freq="
         current date
     shift : int
     clip_shift: bool
+    align : Optional[str]
+        When align is None, this function will raise ValueError if `trading_date` is not a trading date
+        when align is "left"/"right", it will try to align to left/right nearest trading date before shifting when `trading_date` is not a trading date
 
     """
-    from qlib.data import D
+    from qlib.data import D  # pylint: disable=C0415
 
     cal = D.calendar(future=future, freq=freq)
-    if pd.to_datetime(trading_date) not in list(cal):
-        raise ValueError("{} is not trading day!".format(str(trading_date)))
-    _index = bisect.bisect_left(cal, trading_date)
+    trading_date = pd.to_datetime(trading_date)
+    if align is None:
+        if trading_date not in list(cal):
+            raise ValueError("{} is not trading day!".format(str(trading_date)))
+        _index = bisect.bisect_left(cal, trading_date)
+    elif align == "left":
+        _index = bisect.bisect_right(cal, trading_date) - 1
+    elif align == "right":
+        _index = bisect.bisect_left(cal, trading_date)
+    else:
+        raise ValueError(f"align with value `{align}` is not supported")
     shift_index = _index + shift
     if shift_index < 0 or shift_index >= len(cal):
         if clip_shift:
@@ -582,7 +450,7 @@ def transform_end_date(end_date=None, freq="day"):
     date : pandas.Timestamp
         current date
     """
-    from ..data import D
+    from ..data import D  # pylint: disable=C0415
 
     last_date = D.calendar(freq=freq)[-1]
     if end_date is None or (str(end_date) == "-1") or (pd.Timestamp(last_date) < pd.Timestamp(end_date)):
@@ -693,14 +561,13 @@ def exists_qlib_data(qlib_dir):
             return False
     # check calendar bin
     for _calendar in calendars_dir.iterdir():
-
         if ("_future" not in _calendar.name) and (
             not list(features_dir.rglob(f"*.{_calendar.name.split('.')[0]}.bin"))
         ):
             return False
 
     # check instruments
-    code_names = set(map(lambda x: x.name.lower(), features_dir.iterdir()))
+    code_names = set(map(lambda x: fname_to_code(x.name.lower()), features_dir.iterdir()))
     _instrument = instruments_dir.joinpath("all.txt")
     miss_code = set(pd.read_csv(_instrument, sep="\t", header=None).loc[:, 0].apply(str.lower)) - set(code_names)
     if miss_code and any(map(lambda x: "sht" not in x, miss_code)):
@@ -712,16 +579,13 @@ def exists_qlib_data(qlib_dir):
 def check_qlib_data(qlib_config):
     inst_dir = Path(qlib_config["provider_uri"]).joinpath("instruments")
     for _p in inst_dir.glob("*.txt"):
-        try:
-            assert len(pd.read_csv(_p, sep="\t", nrows=0, header=None).columns) == 3, (
-                f"\nThe {str(_p.resolve())} of qlib data is not equal to 3 columns:"
-                f"\n\tIf you are using the data provided by qlib: "
-                f"https://qlib.readthedocs.io/en/latest/component/data.html#qlib-format-dataset"
-                f"\n\tIf you are using your own data, please dump the data again: "
-                f"https://qlib.readthedocs.io/en/latest/component/data.html#converting-csv-format-into-qlib-format"
-            )
-        except AssertionError:
-            raise
+        assert len(pd.read_csv(_p, sep="\t", nrows=0, header=None).columns) == 3, (
+            f"\nThe {str(_p.resolve())} of qlib data is not equal to 3 columns:"
+            f"\n\tIf you are using the data provided by qlib: "
+            f"https://qlib.readthedocs.io/en/latest/component/data.html#qlib-format-dataset"
+            f"\n\tIf you are using your own data, please dump the data again: "
+            f"https://qlib.readthedocs.io/en/latest/component/data.html#converting-csv-format-into-qlib-format"
+        )
 
 
 def lazy_sort_index(df: pd.DataFrame, axis=0) -> pd.DataFrame:
@@ -741,11 +605,15 @@ def lazy_sort_index(df: pd.DataFrame, axis=0) -> pd.DataFrame:
         sorted dataframe
     """
     idx = df.index if axis == 0 else df.columns
-    # NOTE: MultiIndex.is_lexsorted() is a deprecated method in Pandas 1.3.0 and is suggested to be replaced by MultiIndex.is_monotonic_increasing (see discussion here: https://github.com/pandas-dev/pandas/issues/32259). However, in case older versions of Pandas is implemented, MultiIndex.is_lexsorted() is necessary to prevent certain fatal errors.
-    if idx.is_monotonic_increasing and not (isinstance(idx, pd.MultiIndex) and not idx.is_lexsorted()):
-        return df
-    else:
+    if (
+        not idx.is_monotonic_increasing
+        or not is_deprecated_lexsorted_pandas
+        and isinstance(idx, pd.MultiIndex)
+        and not idx.is_lexsorted()
+    ):  # this case is for the old version
         return df.sort_index(axis=axis)
+    else:
+        return df
 
 
 FLATTEN_TUPLE = "_FLATTEN_TUPLE"
@@ -782,6 +650,150 @@ def flatten_dict(d, parent_key="", sep=".") -> dict:
     return dict(items)
 
 
+def get_item_from_obj(config: dict, name_path: str) -> object:
+    """
+    Follow the name_path to get values from config
+    For example:
+    If we follow the example in in the Parameters section,
+        Timestamp('2008-01-02 00:00:00') will be returned
+
+    Parameters
+    ----------
+    config : dict
+        e.g.
+        {'dataset': {'class': 'DatasetH',
+          'kwargs': {'handler': {'class': 'Alpha158',
+                                 'kwargs': {'end_time': '2020-08-01',
+                                            'fit_end_time': '<dataset.kwargs.segments.train.1>',
+                                            'fit_start_time': '<dataset.kwargs.segments.train.0>',
+                                            'instruments': 'csi100',
+                                            'start_time': '2008-01-01'},
+                                 'module_path': 'qlib.contrib.data.handler'},
+                     'segments': {'test': (Timestamp('2017-01-03 00:00:00'),
+                                           Timestamp('2019-04-08 00:00:00')),
+                                  'train': (Timestamp('2008-01-02 00:00:00'),
+                                            Timestamp('2014-12-31 00:00:00')),
+                                  'valid': (Timestamp('2015-01-05 00:00:00'),
+                                            Timestamp('2016-12-30 00:00:00'))}}
+        }}
+    name_path : str
+        e.g.
+        "dataset.kwargs.segments.train.1"
+
+    Returns
+    -------
+    object
+        the retrieved object
+    """
+    cur_cfg = config
+    for k in name_path.split("."):
+        if isinstance(cur_cfg, dict):
+            cur_cfg = cur_cfg[k]  # may raise KeyError
+        elif k.isdigit():
+            cur_cfg = cur_cfg[int(k)]  # may raise IndexError
+        else:
+            raise ValueError(f"Error when getting {k} from cur_cfg")
+    return cur_cfg
+
+
+def fill_placeholder(config: dict, config_extend: dict):
+    """
+    Detect placeholder in config and fill them with config_extend.
+    The item of dict must be single item(int, str, etc), dict and list. Tuples are not supported.
+    There are two type of variables:
+    - user-defined variables :
+        e.g. when config_extend is `{"<MODEL>": model, "<DATASET>": dataset}`, "<MODEL>" and "<DATASET>" in `config` will be replaced with `model` `dataset`
+    - variables extracted from `config` :
+        e.g. the variables like "<dataset.kwargs.segments.train.0>" will be replaced with the values from `config`
+
+    Parameters
+    ----------
+    config : dict
+        the parameter dict will be filled
+    config_extend : dict
+        the value of all placeholders
+
+    Returns
+    -------
+    dict
+        the parameter dict
+    """
+    # check the format of config_extend
+    for placeholder in config_extend.keys():
+        assert re.match(r"<[^<>]+>", placeholder)
+
+    # bfs
+    top = 0
+    tail = 1
+    item_queue = [config]
+
+    def try_replace_placeholder(value):
+        if value in config_extend.keys():
+            value = config_extend[value]
+        else:
+            m = re.match(r"<(?P<name_path>[^<>]+)>", value)
+            if m is not None:
+                try:
+                    value = get_item_from_obj(config, m.groupdict()["name_path"])
+                except (KeyError, ValueError, IndexError):
+                    get_module_logger("fill_placeholder").info(
+                        f"{value} lookes like a placeholder, but it can't match to any given values"
+                    )
+        return value
+
+    while top < tail:
+        now_item = item_queue[top]
+        top += 1
+        if isinstance(now_item, list):
+            item_keys = range(len(now_item))
+        elif isinstance(now_item, dict):
+            item_keys = now_item.keys()
+        for key in item_keys:  # noqa
+            if isinstance(now_item[key], (list, dict)):
+                item_queue.append(now_item[key])
+                tail += 1
+            elif isinstance(now_item[key], str):
+                # If it is a string, try to replace it with placeholder
+                now_item[key] = try_replace_placeholder(now_item[key])
+    return config
+
+
+def auto_filter_kwargs(func: Callable, warning=True) -> Callable:
+    """
+    this will work like a decoration function
+
+    The decrated function will ignore and give warning when the parameter is not acceptable
+
+    For example, if you have a function `f` which may optionally consume the keywards `bar`.
+    then you can call it by `auto_filter_kwargs(f)(bar=3)`, which will automatically filter out
+    `bar` when f does not need bar
+
+    Parameters
+    ----------
+    func : Callable
+        The original function
+
+    Returns
+    -------
+    Callable:
+        the new callable function
+    """
+
+    def _func(*args, **kwargs):
+        spec = inspect.getfullargspec(func)
+        new_kwargs = {}
+        for k, v in kwargs.items():
+            # if `func` don't accept variable keyword arguments like `**kwargs` and have not according named arguments
+            if spec.varkw is None and k not in spec.args:
+                if warning:
+                    log.warning(f"The parameter `{k}` with value `{v}` is ignored.")
+            else:
+                new_kwargs[k] = v
+        return func(*args, **new_kwargs)
+
+    return _func
+
+
 #################### Wrapper #####################
 class Wrapper:
     """Wrapper class for anything that needs to set up during qlib.init"""
@@ -814,7 +826,7 @@ def register_wrapper(wrapper, cls_or_obj, module_path=None):
     wrapper.register(obj)
 
 
-def load_dataset(path_or_obj):
+def load_dataset(path_or_obj, index_col=[0, 1]):
     """load dataset from multiple file formats"""
     if isinstance(path_or_obj, pd.DataFrame):
         return path_or_obj
@@ -826,7 +838,7 @@ def load_dataset(path_or_obj):
     elif extension == ".pkl":
         return pd.read_pickle(path_or_obj)
     elif extension == ".csv":
-        return pd.read_csv(path_or_obj, parse_dates=True, index_col=[0, 1])
+        return pd.read_csv(path_or_obj, parse_dates=True, index_col=index_col)
     raise ValueError(f"unsupported file type `{extension}`")
 
 
@@ -857,7 +869,33 @@ def fname_to_code(fname: str):
     ----------
     fname: str
     """
+
     prefix = "_qlib_"
     if fname.startswith(prefix):
         fname = fname.lstrip(prefix)
     return fname
+
+
+from .mod import (
+    get_module_by_module_path,
+    split_module_path,
+    get_callable_kwargs,
+    get_cls_kwargs,
+    init_instance_by_config,
+    class_casting,
+)
+
+__all__ = [
+    "get_or_create_path",
+    "save_multiple_parts_file",
+    "unpack_archive_with_buffer",
+    "get_tmp_file_with_buffer",
+    "set_log_with_config",
+    "init_instance_by_config",
+    "get_module_by_module_path",
+    "split_module_path",
+    "get_callable_kwargs",
+    "get_cls_kwargs",
+    "init_instance_by_config",
+    "class_casting",
+]

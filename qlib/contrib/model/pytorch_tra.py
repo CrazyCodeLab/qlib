@@ -6,10 +6,8 @@ import os
 import copy
 import math
 import json
-import collections
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import matplotlib.pyplot as plt
 
 import torch
@@ -19,12 +17,12 @@ import torch.nn.functional as F
 
 try:
     from torch.utils.tensorboard import SummaryWriter
-except:
+except ImportError:
     SummaryWriter = None
 
 from tqdm import tqdm
 
-from qlib.utils import get_or_create_path
+from qlib.constant import EPS
 from qlib.log import get_module_logger
 from qlib.model.base import Model
 from qlib.contrib.data.dataset import MTSDatasetH
@@ -74,7 +72,7 @@ class TRAModel(Model):
         lamb=0.0,
         rho=0.99,
         alpha=1.0,
-        seed=0,
+        seed=None,
         logdir=None,
         eval_train=False,
         eval_test=False,
@@ -86,7 +84,6 @@ class TRAModel(Model):
         transport_method="none",
         memory_mode="sample",
     ):
-
         self.logger = get_module_logger("TRA")
 
         assert memory_mode in ["sample", "daily"], "invalid memory mode"
@@ -99,8 +96,9 @@ class TRAModel(Model):
         if transport_method == "router" and not eval_train:
             self.logger.warning("`eval_train` will be ignored when using TRA.router")
 
-        np.random.seed(seed)
-        torch.manual_seed(seed)
+        if seed is not None:
+            np.random.seed(seed)
+            torch.manual_seed(seed)
 
         self.model_config = model_config
         self.tra_config = tra_config
@@ -137,7 +135,6 @@ class TRAModel(Model):
         self._init_model()
 
     def _init_model(self):
-
         self.logger.info("init TRAModel...")
 
         self.model = eval(self.model_type)(**self.model_config).to(device)
@@ -168,8 +165,8 @@ class TRAModel(Model):
             for param in self.tra.predictors.parameters():
                 param.requires_grad_(False)
 
-        self.logger.info("# model params: %d" % sum([p.numel() for p in self.model.parameters() if p.requires_grad]))
-        self.logger.info("# tra params: %d" % sum([p.numel() for p in self.tra.parameters() if p.requires_grad]))
+        self.logger.info("# model params: %d" % sum(p.numel() for p in self.model.parameters() if p.requires_grad))
+        self.logger.info("# tra params: %d" % sum(p.numel() for p in self.tra.parameters() if p.requires_grad))
 
         self.optimizer = optim.Adam(list(self.model.parameters()) + list(self.tra.parameters()), lr=self.lr)
 
@@ -177,7 +174,6 @@ class TRAModel(Model):
         self.global_step = -1
 
     def train_epoch(self, epoch, data_set, is_pretrain=False):
-
         self.model.train()
         self.tra.train()
         data_set.train()
@@ -231,7 +227,7 @@ class TRAModel(Model):
                     choice_all.append(pd.DataFrame(choice.detach().cpu().numpy(), index=index))
                 decay = self.rho ** (self.global_step // 100)  # decay every 100 steps
                 lamb = 0 if is_pretrain else self.lamb * decay
-                reg = prob.log().mul(P).sum(dim=1).mean()  # train router to predict OT assignment
+                reg = prob.log().mul(P).sum(dim=1).mean()  # train router to predict TO assignment
                 if self._writer is not None and not is_pretrain:
                     self._writer.add_scalar("training/router_loss", -reg.item(), self.global_step)
                     self._writer.add_scalar("training/reg_loss", loss.item(), self.global_step)
@@ -255,7 +251,7 @@ class TRAModel(Model):
             total_loss += loss.item()
             total_count += 1
 
-        if self.use_daily_transport and len(P_all):
+        if self.use_daily_transport and len(P_all) > 0:
             P_all = pd.concat(P_all, axis=0)
             prob_all = pd.concat(prob_all, axis=0)
             choice_all = pd.concat(choice_all, axis=0)
@@ -275,7 +271,6 @@ class TRAModel(Model):
         return total_loss
 
     def test_epoch(self, epoch, data_set, return_pred=False, prefix="test", is_pretrain=False):
-
         self.model.eval()
         self.tra.eval()
         data_set.eval()
@@ -361,7 +356,6 @@ class TRAModel(Model):
         return metrics, preds, probs, P_all
 
     def _fit(self, train_set, valid_set, test_set, evals_result, is_pretrain=True):
-
         best_score = -1
         best_epoch = 0
         stop_rounds = 0
@@ -420,7 +414,6 @@ class TRAModel(Model):
         return best_score
 
     def fit(self, dataset, evals_result=dict()):
-
         assert isinstance(dataset, MTSDatasetH), "TRAModel only supports `qlib.contrib.data.dataset.MTSDatasetH`"
 
         train_set, valid_set, test_set = dataset.prepare(["train", "valid", "test"])
@@ -504,7 +497,6 @@ class TRAModel(Model):
                 json.dump(info, f)
 
     def predict(self, dataset, segment="test"):
-
         assert isinstance(dataset, MTSDatasetH), "TRAModel only supports `qlib.contrib.data.dataset.MTSDatasetH`"
 
         if not self.fitted:
@@ -572,7 +564,6 @@ class RNN(nn.Module):
             self.output_size = hidden_size
 
     def forward(self, x):
-
         if self.input_proj is not None:
             x = self.input_proj(x)
 
@@ -648,7 +639,6 @@ class Transformer(nn.Module):
         self.output_size = hidden_size
 
     def forward(self, x):
-
         x = x.permute(1, 0, 2).contiguous()  # the first dim need to be time
         x = self.pe(x)
 
@@ -662,7 +652,7 @@ class TRA(nn.Module):
 
     """Temporal Routing Adaptor (TRA)
 
-    TRA takes historical prediction erros & latent representation as inputs,
+    TRA takes historical prediction errors & latent representation as inputs,
     then routes the input sample to a specific predictor for training & inference.
 
     Args:
@@ -714,7 +704,6 @@ class TRA(nn.Module):
             child.reset_parameters()
 
     def forward(self, hidden, hist_loss):
-
         preds = self.predictors(hidden)
 
         if self.num_states == 1:  # no need for router when having only one prediction
@@ -743,7 +732,7 @@ def evaluate(pred):
     score = pred.score
     label = pred.label
     diff = score - label
-    MSE = (diff ** 2).mean()
+    MSE = (diff**2).mean()
     MAE = (diff.abs()).mean()
     IC = score.corr(label, method="spearman")
     return {"MSE": MSE, "MAE": MAE, "IC": IC}
@@ -790,7 +779,7 @@ def minmax_norm(x):
     xmin = x.min(dim=-1, keepdim=True).values
     xmax = x.max(dim=-1, keepdim=True).values
     mask = (xmin == xmax).squeeze()
-    x = (x - xmin) / (xmax - xmin + 1e-12)
+    x = (x - xmin) / (xmax - xmin + EPS)
     x[mask] = 1
     return x
 

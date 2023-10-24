@@ -10,6 +10,7 @@
 
 > *Please pay **ATTENTION** that the data is collected from [Yahoo Finance](https://finance.yahoo.com/lookup) and the data might not be perfect. We recommend users to prepare their own data if they have high-quality dataset. For more information, users can refer to the [related document](https://qlib.readthedocs.io/en/latest/component/data.html#converting-csv-format-into-qlib-format)*
 
+**NOTE**:  Yahoo! Finance has blocked the access from China. Please change your network if you want to use the Yahoo data crawler.
 
 >  **Examples of abnormal data**
 
@@ -27,14 +28,15 @@ pip install -r requirements.txt
 ## Collector Data
 
 ### Get Qlib data(`bin file`)
-  > `qlib-data` from *YahooFinance*, is the data that has been dumped and can be used directly in `qlib`
+  > `qlib-data` from *YahooFinance*, is the data that has been dumped and can be used directly in `qlib`.
+  > This ready-made qlib-data is not updated regularly. If users want the latest data, please follow [these steps](#collector-yahoofinance-data-to-qlib) download the latest data. 
 
   - get data: `python scripts/get_data.py qlib_data`
   - parameters:
     - `target_dir`: save dir, by default *~/.qlib/qlib_data/cn_data*
     - `version`: dataset version, value from [`v1`, `v2`], by default `v1`
       - `v2` end date is *2021-06*, `v1` end date is *2020-09*
-      - user can append data to `v2`: [automatic update of daily frequency data](#automatic-update-of-daily-frequency-datafrom-yahoo-finance)
+      - If users want to incrementally update data, they need to use yahoo collector to [collect data from scratch](#collector-yahoofinance-data-to-qlib).
       - **the [benchmarks](https://github.com/microsoft/qlib/tree/main/examples/benchmarks) for qlib use `v1`**, *due to the unstable access to historical data by YahooFinance, there are some differences between `v2` and `v1`*
     - `interval`: `1d` or `1min`, by default `1d`
     - `region`: `cn` or `us` or `in`, by default `cn`
@@ -43,28 +45,31 @@ pip install -r requirements.txt
   - examples:
     ```bash
     # cn 1d
-    python scripts/get_data.py qlib_data --target_dir ~/.qlib/qlib_data/qlib_cn_1d --region cn
+    python scripts/get_data.py qlib_data --target_dir ~/.qlib/qlib_data/cn_data --region cn
     # cn 1min
-    python scripts/get_data.py qlib_data --target_dir ~/.qlib/qlib_data/qlib_cn_1min --region cn --interval 1min
+    python scripts/get_data.py qlib_data --target_dir ~/.qlib/qlib_data/cn_data_1min --region cn --interval 1min
     # us 1d
-    python scripts/get_data.py qlib_data --target_dir ~/.qlib/qlib_data/qlib_us_1d --region us --interval 1d
+    python scripts/get_data.py qlib_data --target_dir ~/.qlib/qlib_data/us_data --region us --interval 1d
     # us 1min
-    python scripts/get_data.py qlib_data --target_dir ~/.qlib/qlib_data/qlib_us_1min --region us --interval 1min
+    python scripts/get_data.py qlib_data --target_dir ~/.qlib/qlib_data/us_data_1min --region us --interval 1min
     # in 1d
-    python scripts/get_data.py qlib_data --target_dir ~/.qlib/qlib_data/qlib_in_1d --region in --interval 1d
+    python scripts/get_data.py qlib_data --target_dir ~/.qlib/qlib_data/in_data --region in --interval 1d
     # in 1min
-    python scripts/get_data.py qlib_data --target_dir ~/.qlib/qlib_data/qlib_in_1min --region in --interval 1min
+    python scripts/get_data.py qlib_data --target_dir ~/.qlib/qlib_data/in_data_1min --region in --interval 1min
     ```
 
 ### Collector *YahooFinance* data to qlib
-> collector *YahooFinance* data and *dump* into `qlib` format
+> collector *YahooFinance* data and *dump* into `qlib` format.
+> If the above ready-made data can't meet users' requirements,  users can follow this section to crawl the latest data and convert it to qlib-data.
   1. download data to csv: `python scripts/data_collector/yahoo/collector.py download_data`
+     
+     This will download the raw data such as high, low, open, close, adjclose price from yahoo to a local directory. One file per symbol.
 
      - parameters:
           - `source_dir`: save the directory
           - `interval`: `1d` or `1min`, by default `1d`
             > **due to the limitation of the *YahooFinance API*, only the last month's data is available in `1min`**
-          - `region`: `CN` or `US` or `IN`, by default `CN`
+          - `region`: `CN` or `US` or `IN` or `BR`, by default `CN`
           - `delay`: `time.sleep(delay)`, by default *0.5*
           - `start`: start datetime, by default *"2000-01-01"*; *closed interval(including start)*
           - `end`: end datetime, by default `pd.Timestamp(datetime.datetime.now() + pd.Timedelta(days=1))`; *open interval(excluding end)*
@@ -75,20 +80,31 @@ pip install -r requirements.txt
      - examples:
           ```bash
           # cn 1d data
-          python collector.py download_data --source_dir ~/.qlib/stock_data/source/cn_1d --start 2020-01-01 --end 2020-12-31 --delay 1 --interval 1d --region CN
+          python collector.py download_data --source_dir ~/.qlib/stock_data/source/cn_data --start 2020-01-01 --end 2020-12-31 --delay 1 --interval 1d --region CN
           # cn 1min data
-          python collector.py download_data --source_dir ~/.qlib/stock_data/source/cn_1min --delay 1 --interval 1min --region CN
+          python collector.py download_data --source_dir ~/.qlib/stock_data/source/cn_data_1min --delay 1 --interval 1min --region CN
+
           # us 1d data
-          python collector.py download_data --source_dir ~/.qlib/stock_data/source/us_1d --start 2020-01-01 --end 2020-12-31 --delay 1 --interval 1d --region US
+          python collector.py download_data --source_dir ~/.qlib/stock_data/source/us_data --start 2020-01-01 --end 2020-12-31 --delay 1 --interval 1d --region US
           # us 1min data
-          python collector.py download_data --source_dir ~/.qlib/stock_data/source/us_1min --delay 1 --interval 1min --region US
+          python collector.py download_data --source_dir ~/.qlib/stock_data/source/us_data_1min --delay 1 --interval 1min --region US
+
           # in 1d data
-          python collector.py download_data --source_dir ~/.qlib/stock_data/source/in_1d --start 2020-01-01 --end 2020-12-31 --delay 1 --interval 1d --region IN
+          python collector.py download_data --source_dir ~/.qlib/stock_data/source/in_data --start 2020-01-01 --end 2020-12-31 --delay 1 --interval 1d --region IN
           # in 1min data
-          python collector.py download_data --source_dir ~/.qlib/stock_data/source/in_1min --delay 1 --interval 1min --region IN
+          python collector.py download_data --source_dir ~/.qlib/stock_data/source/in_data_1min --delay 1 --interval 1min --region IN
+
+          # br 1d data
+          python collector.py download_data --source_dir ~/.qlib/stock_data/source/br_data --start 2003-01-03 --end 2022-03-01 --delay 1 --interval 1d --region BR
+          # br 1min data
+          python collector.py download_data --source_dir ~/.qlib/stock_data/source/br_data_1min --delay 1 --interval 1min --region BR
           ```
   2. normalize data: `python scripts/data_collector/yahoo/collector.py normalize_data`
      
+     This will:
+     1. Normalize high, low, close, open price using adjclose.
+     2. Normalize the high, low, close, open price so that the first valid trading date's close price is 1. 
+
      - parameters:
           - `source_dir`: csv directory
           - `normalize_dir`: result directory
@@ -113,11 +129,20 @@ pip install -r requirements.txt
       - examples:
         ```bash
         # normalize 1d cn
-        python collector.py normalize_data --source_dir ~/.qlib/stock_data/source/cn_1d --normalize_dir ~/.qlib/stock_data/source/cn_1d_nor --region CN --interval 1d
+        python collector.py normalize_data --source_dir ~/.qlib/stock_data/source/cn_data --normalize_dir ~/.qlib/stock_data/source/cn_1d_nor --region CN --interval 1d
+
         # normalize 1min cn
-        python collector.py normalize_data --qlib_data_1d_dir ~/.qlib/qlib_data/qlib_cn_1d --source_dir ~/.qlib/stock_data/source/cn_1min --normalize_dir ~/.qlib/stock_data/source/cn_1min_nor --region CN --interval 1min
+        python collector.py normalize_data --qlib_data_1d_dir ~/.qlib/qlib_data/cn_data --source_dir ~/.qlib/stock_data/source/cn_data_1min --normalize_dir ~/.qlib/stock_data/source/cn_1min_nor --region CN --interval 1min
+
+        # normalize 1d br
+        python scripts/data_collector/yahoo/collector.py normalize_data --source_dir ~/.qlib/stock_data/source/br_data --normalize_dir ~/.qlib/stock_data/source/br_1d_nor --region BR --interval 1d
+
+        # normalize 1min br
+        python collector.py normalize_data --qlib_data_1d_dir ~/.qlib/qlib_data/br_data --source_dir ~/.qlib/stock_data/source/br_data_1min --normalize_dir ~/.qlib/stock_data/source/br_1min_nor --region BR --interval 1min
         ```
   3. dump data: `python scripts/dump_bin.py dump_all`
+    
+     This will convert the normalized csv in `feature` directory as numpy array and store the normalized data one file per column and one symbol per directory. 
     
      - parameters:
        - `csv_path`: stock data path or directory, **normalize result(normalize_dir)**
@@ -133,13 +158,16 @@ pip install -r requirements.txt
      - examples:
        ```bash
        # dump 1d cn
-       python dump_bin.py dump_all --csv_path ~/.qlib/stock_data/source/cn_1d_nor --qlib_dir ~/.qlib/qlib_data/qlib_cn_1d --freq day --exclude_fields date,symbol
+       python dump_bin.py dump_all --csv_path ~/.qlib/stock_data/source/cn_1d_nor --qlib_dir ~/.qlib/qlib_data/cn_data --freq day --exclude_fields date,symbol
        # dump 1min cn
-       python dump_bin.py dump_all --csv_path ~/.qlib/stock_data/source/cn_1min_nor --qlib_dir ~/.qlib/qlib_data/qlib_cn_1min --freq 1min --exclude_fields date,symbol
+       python dump_bin.py dump_all --csv_path ~/.qlib/stock_data/source/cn_1min_nor --qlib_dir ~/.qlib/qlib_data/cn_data_1min --freq 1min --exclude_fields date,symbol
        ```
 
 ### Automatic update of daily frequency data(from yahoo finance)
   > It is recommended that users update the data manually once (--trading_date 2021-05-25) and then set it to update automatically.
+  >
+  > **NOTE**: Users can't incrementally  update data based on the offline data provided by Qlib(some fields are removed to reduce the data size). Users should use [yahoo collector](https://github.com/microsoft/qlib/tree/main/scripts/data_collector/yahoo#automatic-update-of-daily-frequency-datafrom-yahoo-finance) to download Yahoo data from scratch and then incrementally update it.
+  > 
 
   * Automatic update of data to the "qlib" directory each trading day(Linux)
       * use *crontab*: `crontab -e`
@@ -176,12 +204,12 @@ pip install -r requirements.txt
 
   # 1d data cn
   # freq=day, freq default day
-  qlib.init(provider_uri="~/.qlib/qlib_data/qlib_cn_1d", region="cn")
+  qlib.init(provider_uri="~/.qlib/qlib_data/cn_data", region="cn")
   df = D.features(D.instruments("all"), ["$close"], freq="day")
 
   # 1min data cn
   # freq=1min
-  qlib.init(provider_uri="~/.qlib/qlib_data/qlib_cn_1min", region="cn")
+  qlib.init(provider_uri="~/.qlib/qlib_data/cn_data_1min", region="cn")
   inst = D.list_instruments(D.instruments("all"), freq="1min", as_list=True)
   # get 100 symbols
   df = D.features(inst[:100], ["$close"], freq="1min")
@@ -189,11 +217,11 @@ pip install -r requirements.txt
   # df = D.features(D.instruments("all"), ["$close"], freq="1min")
 
   # 1d data us
-  qlib.init(provider_uri="~/.qlib/qlib_data/qlib_us_1d", region="us")
+  qlib.init(provider_uri="~/.qlib/qlib_data/us_data", region="us")
   df = D.features(D.instruments("all"), ["$close"], freq="day")
 
   # 1min data us
-  qlib.init(provider_uri="~/.qlib/qlib_data/qlib_us_1min", region="cn")
+  qlib.init(provider_uri="~/.qlib/qlib_data/us_data_1min", region="cn")
   inst = D.list_instruments(D.instruments("all"), freq="1min", as_list=True)
   # get 100 symbols
   df = D.features(inst[:100], ["$close"], freq="1min")

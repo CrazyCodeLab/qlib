@@ -5,20 +5,12 @@
 from __future__ import division
 from __future__ import print_function
 
-import os
 import numpy as np
 import pandas as pd
 import copy
 import random
-from sklearn.metrics import roc_auc_score, mean_squared_error
-import logging
-from ...utils import (
-    unpack_archive_with_buffer,
-    save_multiple_parts_file,
-    get_or_create_path,
-    drop_nan_by_y_index,
-)
-from ...log import get_module_logger, TimeInspector
+from ...utils import get_or_create_path
+from ...log import get_module_logger
 
 import torch
 import torch.nn as nn
@@ -37,7 +29,7 @@ class TCTS(Model):
     d_feat : int
         input dimension for each time step
     metric: str
-        the evaluate metric used in early stop
+        the evaluation metric used in early stop
     optimizer : str
         optimizer name
     GPU : str
@@ -56,13 +48,15 @@ class TCTS(Model):
         loss="mse",
         fore_optimizer="adam",
         weight_optimizer="adam",
+        input_dim=360,
         output_dim=5,
         fore_lr=5e-7,
         weight_lr=5e-7,
         steps=3,
         GPU=0,
-        seed=0,
         target_label=0,
+        mode="soft",
+        seed=None,
         lowest_valid_performance=0.993,
         **kwargs
     ):
@@ -82,11 +76,13 @@ class TCTS(Model):
         self.device = torch.device("cuda:%d" % (GPU) if torch.cuda.is_available() else "cpu")
         self.use_gpu = torch.cuda.is_available()
         self.seed = seed
+        self.input_dim = input_dim
         self.output_dim = output_dim
         self.fore_lr = fore_lr
         self.weight_lr = weight_lr
         self.steps = steps
         self.target_label = target_label
+        self.mode = mode
         self.lowest_valid_performance = lowest_valid_performance
         self._fore_optimizer = fore_optimizer
         self._weight_optimizer = weight_optimizer
@@ -100,6 +96,8 @@ class TCTS(Model):
             "\nn_epochs : {}"
             "\nbatch_size : {}"
             "\nearly_stop : {}"
+            "\ntarget_label : {}"
+            "\nmode : {}"
             "\nloss_type : {}"
             "\nvisible_GPU : {}"
             "\nuse_GPU : {}"
@@ -111,6 +109,8 @@ class TCTS(Model):
                 n_epochs,
                 batch_size,
                 early_stop,
+                target_label,
+                mode,
                 loss,
                 GPU,
                 self.use_gpu,
@@ -119,22 +119,32 @@ class TCTS(Model):
         )
 
     def loss_fn(self, pred, label, weight):
+        if self.mode == "hard":
+            loc = torch.argmax(weight, 1)
+            loss = (pred - label[np.arange(weight.shape[0]), loc]) ** 2
+            return torch.mean(loss)
 
-        loc = torch.argmax(weight, 1)
-        loss = (pred - label[np.arange(weight.shape[0]), loc]) ** 2
-        return torch.mean(loss)
+        elif self.mode == "soft":
+            loss = (pred - label.transpose(0, 1)) ** 2
+            return torch.mean(loss * weight.transpose(0, 1))
+
+        else:
+            raise NotImplementedError("mode {} is not supported!".format(self.mode))
 
     def train_epoch(self, x_train, y_train, x_valid, y_valid):
-
         x_train_values = x_train.values
         y_train_values = np.squeeze(y_train.values)
 
         indices = np.arange(len(x_train_values))
         np.random.shuffle(indices)
 
+        task_embedding = torch.zeros([self.batch_size, self.output_dim])
+        task_embedding[:, self.target_label] = 1
+        task_embedding = task_embedding.to(self.device)
+
         init_fore_model = copy.deepcopy(self.fore_model)
         for p in init_fore_model.parameters():
-            p.init_fore_model = False
+            p.requires_grad = False
 
         self.fore_model.train()
         self.weight_model.train()
@@ -146,7 +156,6 @@ class TCTS(Model):
 
         for i in range(self.steps):
             for i in range(len(indices))[:: self.batch_size]:
-
                 if len(indices) - i < self.batch_size:
                     break
 
@@ -155,12 +164,13 @@ class TCTS(Model):
 
                 init_pred = init_fore_model(feature)
                 pred = self.fore_model(feature)
-
                 dis = init_pred - label.transpose(0, 1)
-                weight_feature = torch.cat((feature, dis.transpose(0, 1), label, init_pred.view(-1, 1)), 1)
+                weight_feature = torch.cat(
+                    (feature, dis.transpose(0, 1), label, init_pred.view(-1, 1), task_embedding), 1
+                )
                 weight = self.weight_model(weight_feature)
 
-                loss = self.loss_fn(pred, label, weight)  # hard
+                loss = self.loss_fn(pred, label, weight)
 
                 self.fore_optimizer.zero_grad()
                 loss.backward()
@@ -179,7 +189,6 @@ class TCTS(Model):
 
         # fix forecasting model and valid weight model
         for i in range(len(indices))[:: self.batch_size]:
-
             if len(indices) - i < self.batch_size:
                 break
 
@@ -188,11 +197,11 @@ class TCTS(Model):
 
             pred = self.fore_model(feature)
             dis = pred - label.transpose(0, 1)
-            weight_feature = torch.cat((feature, dis.transpose(0, 1), label, pred.view(-1, 1)), 1)
+            weight_feature = torch.cat((feature, dis.transpose(0, 1), label, pred.view(-1, 1), task_embedding), 1)
             weight = self.weight_model(weight_feature)
             loc = torch.argmax(weight, 1)
-            valid_loss = torch.mean((pred - label[:, 0]) ** 2)
-            loss = torch.mean(-valid_loss * torch.log(weight[np.arange(weight.shape[0]), loc]))
+            valid_loss = torch.mean((pred - label[:, abs(self.target_label)]) ** 2)
+            loss = torch.mean(valid_loss * torch.log(weight[np.arange(weight.shape[0]), loc]))
 
             self.weight_optimizer.zero_grad()
             loss.backward()
@@ -200,20 +209,17 @@ class TCTS(Model):
             self.weight_optimizer.step()
 
     def test_epoch(self, data_x, data_y):
-
         # prepare training data
         x_values = data_x.values
         y_values = np.squeeze(data_y.values)
 
         self.fore_model.eval()
 
-        scores = []
         losses = []
 
         indices = np.arange(len(x_values))
 
         for i in range(len(indices))[:: self.batch_size]:
-
             if len(indices) - i < self.batch_size:
                 break
 
@@ -237,12 +243,14 @@ class TCTS(Model):
             col_set=["feature", "label"],
             data_key=DataHandlerLP.DK_L,
         )
+        if df_train.empty or df_valid.empty:
+            raise ValueError("Empty data from dataset, please check your dataset config.")
 
         x_train, y_train = df_train["feature"], df_train["label"]
         x_valid, y_valid = df_valid["feature"], df_valid["label"]
         x_test, y_test = df_test["feature"], df_test["label"]
 
-        if save_path == None:
+        if save_path is None:
             save_path = get_or_create_path(save_path)
         best_loss = np.inf
         while best_loss > self.lowest_valid_performance:
@@ -269,7 +277,6 @@ class TCTS(Model):
         verbose=True,
         save_path=None,
     ):
-
         self.fore_model = GRUModel(
             d_feat=self.d_feat,
             hidden_size=self.hidden_size,
@@ -277,7 +284,7 @@ class TCTS(Model):
             dropout=self.dropout,
         )
         self.weight_model = MLPModel(
-            d_feat=360 + 2 * self.output_dim + 1,
+            d_feat=self.input_dim + 3 * self.output_dim + 1,
             hidden_size=self.hidden_size,
             num_layers=self.num_layers,
             dropout=self.dropout,
@@ -303,8 +310,6 @@ class TCTS(Model):
         best_loss = np.inf
         best_epoch = 0
         stop_round = 0
-        fore_best_param = copy.deepcopy(self.fore_optimizer.state_dict())
-        weight_best_param = copy.deepcopy(self.weight_optimizer.state_dict())
 
         for epoch in range(self.n_epochs):
             print("Epoch:", epoch)
@@ -332,9 +337,9 @@ class TCTS(Model):
                     break
 
         print("best loss:", best_loss, "@", best_epoch)
-        best_param = torch.load(save_path + "_fore_model.bin")
+        best_param = torch.load(save_path + "_fore_model.bin", map_location=self.device)
         self.fore_model.load_state_dict(best_param)
-        best_param = torch.load(save_path + "_weight_model.bin")
+        best_param = torch.load(save_path + "_weight_model.bin", map_location=self.device)
         self.weight_model.load_state_dict(best_param)
         self.fitted = True
 
@@ -355,7 +360,6 @@ class TCTS(Model):
         preds = []
 
         for begin in range(sample_num)[:: self.batch_size]:
-
             if sample_num - begin < self.batch_size:
                 end = sample_num
             else:

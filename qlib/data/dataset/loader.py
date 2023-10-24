@@ -2,6 +2,8 @@
 # Licensed under the MIT License.
 
 import abc
+import pickle
+from pathlib import Path
 import warnings
 import pandas as pd
 
@@ -10,6 +12,7 @@ from typing import Tuple, Union, List
 from qlib.data import D
 from qlib.utils import load_dataset, init_instance_by_config, time_to_slc_point
 from qlib.log import get_module_logger
+from qlib.utils.serial import Serializable
 
 
 class DataLoader(abc.ABC):
@@ -24,7 +27,7 @@ class DataLoader(abc.ABC):
 
         Example of the data (The multi-index of the columns is optional.):
 
-            .. code-block:: python
+            .. code-block:: text
 
                                         feature                                                             label
                                         $close     $volume     Ref($close, 1)  Mean($close, 3)  $high-$low  LABEL0
@@ -48,7 +51,6 @@ class DataLoader(abc.ABC):
         pd.DataFrame:
             data load from the under layer source
         """
-        pass
 
 
 class DLWParser(DataLoader):
@@ -126,7 +128,6 @@ class DLWParser(DataLoader):
         pd.DataFrame:
             the queried dataframe.
         """
-        pass
 
     def load(self, instruments=None, start_time=None, end_time=None) -> pd.DataFrame:
         if self.is_group:
@@ -152,7 +153,7 @@ class QlibDataLoader(DLWParser):
         filter_pipe: List = None,
         swap_level: bool = True,
         freq: Union[str, dict] = "day",
-        inst_processor: dict = None,
+        inst_processors: Union[dict, list] = None,
     ):
         """
         Parameters
@@ -166,16 +167,19 @@ class QlibDataLoader(DLWParser):
         freq:  dict or str
             If type(config) == dict and type(freq) == str, load config data using freq.
             If type(config) == dict and type(freq) == dict, load config[<group_name>] data using freq[<group_name>]
-        inst_processor: dict
-            If inst_processor is not None and type(config) == dict; load config[<group_name>] data using inst_processor[<group_name>]
+        inst_processors: dict | list
+            If inst_processors is not None and type(config) == dict; load config[<group_name>] data using inst_processors[<group_name>]
+            If inst_processors is a list, then it will be applied to all groups.
         """
         self.filter_pipe = filter_pipe
         self.swap_level = swap_level
         self.freq = freq
 
         # sample
-        self.inst_processor = inst_processor if inst_processor is not None else {}
-        assert isinstance(self.inst_processor, dict), f"inst_processor(={self.inst_processor}) must be dict"
+        self.inst_processors = inst_processors if inst_processors is not None else {}
+        assert isinstance(
+            self.inst_processors, (dict, list)
+        ), f"inst_processors(={self.inst_processors}) must be dict or list"
 
         super().__init__(config)
 
@@ -186,8 +190,8 @@ class QlibDataLoader(DLWParser):
                     if _gp not in freq:
                         raise ValueError(f"freq(={freq}) missing group(={_gp})")
                 assert (
-                    self.inst_processor
-                ), f"freq(={self.freq}), inst_processor(={self.inst_processor}) cannot be None/empty"
+                    self.inst_processors
+                ), f"freq(={self.freq}), inst_processors(={self.inst_processors}) cannot be None/empty"
 
     def load_group_df(
         self,
@@ -207,21 +211,24 @@ class QlibDataLoader(DLWParser):
             warnings.warn("`filter_pipe` is not None, but it will not be used with `instruments` as list")
 
         freq = self.freq[gp_name] if isinstance(self.freq, dict) else self.freq
-        df = D.features(
-            instruments, exprs, start_time, end_time, freq=freq, inst_processors=self.inst_processor.get(gp_name, [])
+        inst_processors = (
+            self.inst_processors if isinstance(self.inst_processors, list) else self.inst_processors.get(gp_name, [])
         )
+        df = D.features(instruments, exprs, start_time, end_time, freq=freq, inst_processors=inst_processors)
         df.columns = names
         if self.swap_level:
             df = df.swaplevel().sort_index()  # NOTE: if swaplevel, return <datetime, instrument>
         return df
 
 
-class StaticDataLoader(DataLoader):
+class StaticDataLoader(DataLoader, Serializable):
     """
     DataLoader that supports loading data from file or as provided.
     """
 
-    def __init__(self, config: dict, join="outer"):
+    include_attr = ["_config"]
+
+    def __init__(self, config: Union[dict, str, pd.DataFrame], join="outer"):
         """
         Parameters
         ----------
@@ -230,7 +237,7 @@ class StaticDataLoader(DataLoader):
         join : str
             How to align different dataframes
         """
-        self.config = config
+        self._config = config  # using "_" to avoid confliction with the method `config` of Serializable
         self.join = join
         self._data = None
 
@@ -254,12 +261,18 @@ class StaticDataLoader(DataLoader):
     def _maybe_load_raw_data(self):
         if self._data is not None:
             return
-        self._data = pd.concat(
-            {fields_group: load_dataset(path_or_obj) for fields_group, path_or_obj in self.config.items()},
-            axis=1,
-            join=self.join,
-        )
-        self._data.sort_index(inplace=True)
+        if isinstance(self._config, dict):
+            self._data = pd.concat(
+                {fields_group: load_dataset(path_or_obj) for fields_group, path_or_obj in self._config.items()},
+                axis=1,
+                join=self.join,
+            )
+            self._data.sort_index(inplace=True)
+        elif isinstance(self._config, (str, Path)):
+            with Path(self._config).open("rb") as f:
+                self._data = pickle.load(f)
+        elif isinstance(self._config, pd.DataFrame):
+            self._data = self._config
 
 
 class DataLoaderDH(DataLoader):
@@ -269,7 +282,9 @@ class DataLoaderDH(DataLoader):
     - If you just want to load data from single datahandler, you can write them in single data handler
 
     TODO: What make this module not that easy to use.
+
     - For online scenario
+
         - The underlayer data handler should be configured. But data loader doesn't provide such interface & hook.
     """
 
@@ -297,7 +312,7 @@ class DataLoaderDH(DataLoader):
             is_group will be used to describe whether the key of handler_config is group
 
         """
-        from qlib.data.dataset.handler import DataHandler
+        from qlib.data.dataset.handler import DataHandler  # pylint: disable=C0415
 
         if is_group:
             self.handlers = {
